@@ -57,6 +57,8 @@ async def part3_assignment_suite():
     print("CHECKPOINT 3: Assignment suite → outputs/*.json")
     print("=" * 60)
 
+    from openai import APIConnectionError, APIStatusError
+
     from assignment.pipeline import (
         build_production_plugins,
         build_observability,
@@ -71,6 +73,26 @@ async def part3_assignment_suite():
         print("Suite finished.")
         print("Wrote outputs under repo outputs/")
         return result
+    except APIStatusError as exc:
+        retry_after = exc.response.headers.get("retry-after", "").strip()
+        message = (
+            f"Checkpoint 3 stopped: OpenRouter returned HTTP {exc.status_code} "
+            "for the locked Blue model. No new results were written."
+        )
+        body = exc.body if isinstance(exc.body, dict) else {}
+        detail = str(body.get("error", body)).casefold()
+        if "upstream" in detail:
+            message += " OpenRouter reports an upstream provider error."
+        elif "daily" in detail or "per-day" in detail:
+            message += " OpenRouter reports a daily limit."
+        if retry_after.isascii() and retry_after.isdecimal():
+            message += f" The provider requested a wait of {retry_after} seconds."
+        raise SystemExit(message) from None
+    except APIConnectionError:
+        raise SystemExit(
+            "Checkpoint 3 stopped: the OpenRouter request timed out or could not connect. "
+            "No new results were written."
+        ) from None
     except NotImplementedError as e:
         print(
             "Chưa xong Checkpoint 3 (src/assignment/pipeline.py). "

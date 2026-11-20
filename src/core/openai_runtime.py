@@ -8,8 +8,13 @@ Gemini Red Team dùng Google ADK trong agents/*.py — không đi qua file này.
 """
 from __future__ import annotations
 
+import asyncio
+from inspect import isawaitable
+
 from dataclasses import dataclass, field
 from typing import Any, Callable
+
+from openai import APIStatusError, APITimeoutError
 
 from core.config import (
     get_red_model,
@@ -49,27 +54,51 @@ class OpenAIRunner:
     def _client(self):
         from openai import OpenAI
 
-        return OpenAI(**(self.client_kwargs or {}))
+        kwargs = dict(self.client_kwargs)
+        if self.provider == "openrouter":
+            kwargs.update(max_retries=0, timeout=45.0)
+        return OpenAI(**kwargs)
 
-    async def chat(self, agent: OpenAIAgent, user_message: str) -> str:
+    async def chat(
+        self, agent: OpenAIAgent, user_message: str, *, user_id: str = "student"
+    ) -> str:
         for hook in self.input_hooks:
             blocked = hook(user_message)
             if blocked:
                 return blocked
 
-        block_msg = await self._run_input_plugins(user_message)
+        block_msg = await self.check_input(user_message, user_id=user_id)
         if block_msg is not None:
             return block_msg
 
         client = self._client()
-        completion = client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": agent.instruction},
-                {"role": "user", "content": user_message},
-            ],
-            temperature=self.temperature,
-        )
+        max_attempts = 3 if self.provider == "openrouter" else 1
+        for attempt in range(max_attempts):
+            try:
+                completion = client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": agent.instruction},
+                        {"role": "user", "content": user_message},
+                    ],
+                    temperature=self.temperature,
+                )
+                break
+            except (APIStatusError, APITimeoutError) as exc:
+                status = exc.status_code if isinstance(exc, APIStatusError) else None
+                if attempt + 1 == max_attempts or status not in {None, 429, 502, 503, 504}:
+                    raise
+                headers = exc.response.headers if isinstance(exc, APIStatusError) else {}
+                retry_after = headers.get("retry-after", "").strip()
+                delay = 5 * 2**attempt
+                if retry_after.isascii() and retry_after.isdecimal() and len(retry_after) <= 6:
+                    delay = max(delay, int(retry_after))
+                if delay > 30:
+                    raise
+                reason = f"HTTP {status}" if status is not None else "request timeout"
+                print(f"Blue: OpenRouter {reason}. Retrying in {delay}s.", flush=True)
+                await asyncio.sleep(delay)
+
         text = (completion.choices[0].message.content or "").strip()
 
         for hook in self.output_hooks:
@@ -78,29 +107,25 @@ class OpenAIRunner:
         text = await self._run_output_plugins(text)
         return text
 
-    async def _run_input_plugins(self, user_message: str) -> str | None:
+    async def check_input(
+        self, user_message: str, *, user_id: str = "student"
+    ) -> str | None:
         if not self.plugins:
             return None
-        try:
-            from google.genai import types
-        except ImportError:
-            return None
+        from google.genai import types
 
         user_content = types.Content(
             role="user",
             parts=[types.Part.from_text(text=user_message)],
         )
-        ctx = _MockInvocationContext()
+        ctx = _MockInvocationContext(user_id=user_id)
         for plugin in self.plugins:
             cb = getattr(plugin, "on_user_message_callback", None)
             if cb is None:
                 continue
-            try:
-                result = await cb(
-                    invocation_context=ctx, user_message=user_content
-                )
-            except TypeError:
-                result = cb(invocation_context=ctx, user_message=user_content)
+            result = cb(invocation_context=ctx, user_message=user_content)
+            if isawaitable(result):
+                result = await result
             if result is None:
                 continue
             return _content_to_text(result)
@@ -109,10 +134,7 @@ class OpenAIRunner:
     async def _run_output_plugins(self, text: str) -> str:
         if not self.plugins or not text:
             return text
-        try:
-            from google.genai import types
-        except ImportError:
-            return text
+        from google.genai import types
 
         content = types.Content(
             role="model", parts=[types.Part.from_text(text=text)]
@@ -131,13 +153,12 @@ class OpenAIRunner:
             cb = getattr(plugin, "after_model_callback", None)
             if cb is None:
                 continue
-            try:
-                out = await cb(callback_context=_Ctx(), llm_response=llm_response)
-            except TypeError:
-                out = cb(callback_context=_Ctx(), llm_response=llm_response)
+            out = cb(callback_context=_Ctx(), llm_response=llm_response)
+            if isawaitable(out):
+                out = await out
             if out is not None and getattr(out, "content", None) is not None:
                 llm_response = out
-        return _content_to_text(llm_response.content) or text
+        return _content_to_text(llm_response.content)
 
 
 def _content_to_text(content: Any) -> str:

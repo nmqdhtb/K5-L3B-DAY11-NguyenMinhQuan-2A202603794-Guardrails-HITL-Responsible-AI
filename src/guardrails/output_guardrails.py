@@ -12,6 +12,7 @@ from google.adk.agents import llm_agent
 from google.adk import runners
 from google.adk.plugins import base_plugin
 
+from core.config import DEMO_SECRETS
 from core.utils import chat_with_agent
 
 
@@ -28,7 +29,7 @@ from core.utils import chat_with_agent
 # ============================================================
 
 def content_filter(response: str) -> dict:
-    """Filter response for PII, secrets, and harmful content.
+    """Filter response for PII and secrets.
 
     Args:
         response: The LLM's response text
@@ -41,19 +42,23 @@ def content_filter(response: str) -> dict:
 
     # PII patterns to check
     PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+        "national_id": r"\b(?:[0-9]{9}|[0-9]{12})\b",
+        "phone": r"(?<!\d)(?:0|\+84[ .-]?)(?:\d[ .-]?){8,9}\d(?!\d)",
+        "email": r"[\w.!#$%&'*+/=?^_`{|}~-]+@[\w-]+(?:\.[\w-]+)*\.[a-z]{2,}\b",
+        "api_key": r"\bsk-[a-z0-9_-]+",
+        "database_host": r"\b(?:[a-z0-9-]+\.)+vinbank\.internal\b",
+        "password": r"""\bpassword\s*(?:[:=]\s*|is\s+)(?:"[^"\n]+"|'[^'\n]+'|[^\s,;]+?(?=[.,;]?(?:\s|$)))""",
     }
 
     for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
-        if matches:
-            issues.append(f"{name}: {len(matches)} found")
-            redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+        redacted, count = re.subn(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+        if count:
+            issues.append(f"{name}: {count} found")
+
+    for secret in DEMO_SECRETS:
+        redacted, count = re.subn(re.escape(secret), "[REDACTED]", redacted, flags=re.IGNORECASE)
+        if count:
+            issues.append(f"protected value: {count} found")
 
     return {
         "safe": len(issues) == 0,
@@ -154,7 +159,7 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         """Extract text from LLM response."""
         text = ""
         if hasattr(llm_response, "content") and llm_response.content:
-            for part in llm_response.content.parts:
+            for part in llm_response.content.parts or []:
                 if hasattr(part, "text") and part.text:
                     text += part.text
         return text
@@ -172,16 +177,23 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        result = content_filter(response_text)
+        if not result["safe"]:
+            self.redacted_count += 1
 
-        return llm_response  # TODO: modify if needed
+        safe_text = result["redacted"]
+        if self.use_llm_judge:
+            verdict = await llm_safety_check(safe_text)
+            if not verdict["safe"]:
+                self.blocked_count += 1
+                safe_text = "Response withheld for safety."
+
+        if safe_text != response_text:
+            llm_response.content = types.Content(
+                role=llm_response.content.role or "model",
+                parts=[types.Part.from_text(text=safe_text)],
+            )
+        return llm_response
 
 
 # ============================================================

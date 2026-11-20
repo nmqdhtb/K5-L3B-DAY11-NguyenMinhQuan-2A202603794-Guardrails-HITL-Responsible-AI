@@ -42,7 +42,7 @@ from agents.security_boundary import (
     normalize_for_security,
 )
 from agents.red_advance_nemo import NemoRailsGuard, nemo_layer_label
-from core.config import ALLOWED_TOPICS, BLOCKED_TOPICS, DEMO_SECRETS, DEMO_SECRET_NOTE
+from core.config import BLOCKED_TOPICS, DEMO_SECRETS, DEMO_SECRET_NOTE
 from core.utils import chat_with_agent
 
 # Secrets embedded in the Red Advance system prompt
@@ -130,22 +130,10 @@ def detect_injection_strong(text: str) -> bool:
 
 
 def topic_filter_strong(text: str) -> bool:
-    """Return True if input should be BLOCKED."""
-    lower = text.lower()
-    if any(b in lower for b in BLOCKED_TOPICS):
-        return True
-    # Allow short banking questions; block if no banking signal and looks extractive
-    if any(a in lower for a in ALLOWED_TOPICS):
-        return False
-    # Pure extraction / meta questions without banking keywords
-    extractive = (
-        "password", "api key", "system prompt", "hướng dẫn", "mật khẩu",
-        "secret", "credential", "internal", "config",
-    )
-    if any(e in lower for e in extractive):
-        return True
-    # Off-topic (no allowed banking keyword)
-    return True
+    """Return True if input should be blocked."""
+    from guardrails.input_guardrails import topic_filter
+
+    return any(topic in text.casefold() for topic in BLOCKED_TOPICS) or topic_filter(text) == "BLOCK"
 
 
 def content_filter_strong(response: str) -> dict:
